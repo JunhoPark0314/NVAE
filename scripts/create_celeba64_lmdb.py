@@ -21,7 +21,7 @@ def main(split, img_path, lmdb_path):
     lmdb_path = os.path.join(lmdb_path, '%s.lmdb' % lmdb_split)
 
     # if you don't have this will download the data
-    data = dset.celeba.CelebA(root=img_path, split=split, target_type='attr', transform=None, download=True)
+    data = dset.celeba.CelebA(root=img_path, split=split, target_type='attr', transform=None, download=False)
     print(len('total data'))
 
     # create lmdb

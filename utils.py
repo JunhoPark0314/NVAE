@@ -325,10 +325,12 @@ def get_input_size(dataset):
         raise NotImplementedError
 
 
-def pre_process(x, num_bits):
+def pre_process(x, num_bits, normalize=False):
     if num_bits != 8:
         x = torch.floor(x * 255 / 2 ** (8 - num_bits))
         x /= (2 ** num_bits - 1)
+    if normalize:
+        x = x * 2 - 1
     return x
 
 

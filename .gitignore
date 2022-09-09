@@ -3,3 +3,5 @@ visualizations/
 .run/
 *.pyc
 *.pdf
+data
+output

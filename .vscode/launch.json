@@ -1,0 +1,79 @@
+{
+    // IntelliSense를 사용하여 가능한 특성에 대해 알아보세요.
+    // 기존 특성에 대한 설명을 보려면 가리킵니다.
+    // 자세한 내용을 보려면 https://go.microsoft.com/fwlink/?linkid=830387을(를) 방문하세요.
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Dataset ",
+            "type": "python",
+            "request": "launch",
+            "program": "scripts/create_celeba64_lmdb.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args":[
+                "--split", "test",
+                "--img_path", "data",
+                "--lmdb_path", "data/celeba64_lmdb"
+            ]
+        },
+        {
+            "name": "Train",
+            "type": "python",
+            "request": "launch",
+            "program": "distill_diffusion_train.py",
+            // "program": "train.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--data",
+                "data/celeba64_lmdb",
+                "--ddim",
+                "ddim/configs/celeba.yml",
+                "--root",
+                "output",
+                "--save",
+                "celeba_distill",
+                "--dataset",
+                "celeba_64",
+                "--num_channels_enc",
+                "32",
+                "--num_channels_dec",
+                "32",
+                "--epochs",
+                "90",
+                "--num_postprocess_cells",
+                "2",
+                "--num_preprocess_cells",
+                "2",
+                "--num_latent_scales",
+                "3",
+                "--num_latent_per_group",
+                "12",
+                "--num_cell_per_cond_enc",
+                "2",
+                "--num_cell_per_cond_dec",
+                "2",
+                "--num_preprocess_blocks",
+                "1",
+                "--num_postprocess_blocks",
+                "1",
+                "--weight_decay_norm",
+                "1e-1",
+                "--num_groups_per_scale",
+                "12",
+                "--batch_size",
+                "32",
+                "--num_nf",
+                "1",
+                "--ada_groups",
+                // "--num_process_per_node", "2",
+                "--num_process_per_node",
+                "2",
+                "--use_se",
+                "--res_dist",
+                "--fast_adamax"
+            ]
+        },
+    ]
+}

@@ -51,24 +51,27 @@ class Normal:
 
 
 class NormalDecoder:
-    def __init__(self, param, num_bits=8):
+    def __init__(self, param, num_bits=8, normalize=True):
         B, C, H, W = param.size()
         self.num_c = C // 2
         mu = param[:, :self.num_c, :, :]                                 # B, 3, H, W
         log_sigma = param[:, self.num_c:, :, :]                          # B, 3, H, W
         self.dist = Normal(mu, log_sigma)
-
+        self.normalize = normalize
+    
     def log_prob(self, samples):
-        assert torch.max(samples) <= 1.0 and torch.min(samples) >= 0.0
-        # convert samples to be in [-1, 1]
-        samples = 2 * samples - 1.0
+        if self.normalize:
+            assert torch.max(samples) <= 1.0 and torch.min(samples) >= 0.0
+            # convert samples to be in [-1, 1]
+            samples = 2 * samples - 1.0
 
         return self.dist.log_p(samples)
 
     def sample(self, t=1.):
         x, _ = self.dist.sample()
-        x = torch.clamp(x, -1, 1.)
-        x = x / 2. + 0.5
+        if self.normalize:
+            x = torch.clamp(x, -1, 1.)
+            x = x / 2. + 0.5
         return x
 
 
