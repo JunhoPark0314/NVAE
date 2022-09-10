@@ -525,7 +525,7 @@ class AutoEncoder(nn.Module):
         idx_dec = 0
         s = self.prior_ftr0.unsqueeze(0)
         batch_size = z.size(0)
-        s = s.expand(batch_size, -1, -1, -1) + getattr(self,f'unet_tcond_{s.shape[2]}')(hs.pop(), temb)
+        s = s.expand(batch_size, -1, -1, -1) + hs.pop()
         for cell, skip_cell in zip(self.dec_tower, self.dec_skip_tower):
             if cell.cell_type == 'combiner_dec':
                 if idx_dec > 0:
@@ -557,7 +557,10 @@ class AutoEncoder(nn.Module):
         logits = self.image_conditional(s)
         return logits
 
-    def decoder_output(self, logits):
+    def decoder_output(self, logits, prev_x, a_prev):
+        mu, sigma = torch.chunk(logits, logits.shape[1]//2, 1)
+        new_mu = (prev_x - mu * (1 - a_prev).sqrt()) / a_prev.sqrt()
+        logits = torch.cat([new_mu, sigma], 1)
         if self.dataset in {'mnist', 'omniglot'}:
             return Bernoulli(logits=logits)
         elif self.dataset in {'stacked_mnist', 'cifar10', 'celeba_64', 'celeba_256', 'imagenet_32', 'imagenet_64', 'ffhq',
