@@ -97,7 +97,7 @@ class Diffusion(object):
         self.trg_denoiser.eval()
 
         self.timesteps = config.variable.timesteps
-        skip = self.num_timesteps // self.timesteps
+        skip = self.num_timesteps // (self.timesteps + 1)
         self.trg_step = torch.arange(0, self.num_timesteps, skip, device=self.device)
 
         self.img_channels = config.model.in_channels
@@ -105,11 +105,14 @@ class Diffusion(object):
 
     
     def antithetic_timestep_sample(self, N):
-        t = torch.randint(
-            low=0, high=self.timesteps-1, size=(N // 2 + 1,)
-        ).to(self.device)
-        t = torch.cat([t, self.timesteps - t - 2], dim=0)[:N] + 1
-        return t
+        S = (len(self.trg_step) - 1)
+        return ((torch.arange(N) + (S * torch.rand(1)).floor().long()) % S).to(self.device)
+        # t = torch.arange(N).to(self.device) + self.timesteps * torch.rand(1).to(self.device)
+        # t = torch.randint(
+        #     low=0, high=self.timesteps, size=(N // 2 + 1,)
+        # ).to(self.device)
+        # t = torch.cat([t, self.timesteps - t - 1], dim=0)[:N] + 1
+        # return t
 
     def sample_noised(self, x, e, t):
         step = self.trg_step.index_select(0, t)
@@ -117,9 +120,11 @@ class Diffusion(object):
         return x * a.sqrt() + e * (1 - a).sqrt(), a
 
     def denoise_step(self, noised, t, eps=None, **kwargs):
+        assert (t.max() < len(self.trg_step)).all().item() and (t.min() >=0).all().item()
         step = self.trg_step.index_select(0, t)
+        next_step = self.trg_step.index_select(0, (t-1).clip(min=0))
         at = compute_alpha(self.betas, step)
-        at_next = compute_alpha(self.betas, step-1)
+        at_next = compute_alpha(self.betas, next_step)
         # eps is distribution use sample and return distribution
         if eps is None:
             eps = self.trg_denoiser(noised, step)
@@ -145,16 +150,26 @@ class Diffusion(object):
 
             xs_list = [xt]
             x0_list = [xt]
-            tidx = reversed(list(range(self.timesteps)))
+            tidx_list = reversed(list(range(0, len(self.trg_step))))
 
-            for ti in tidx:
-                step = self.trg_step.index_select(0, ti)
-                eps_pred = model.inference(xt, step)
-                xt, x0_t = self.denoise_step(xt, ti, eps=eps_pred)
-                xs_list.append(xt)
+            for ti in tidx_list:
+                tidx = ti * torch.ones(len(xt), device=self.device, dtype=torch.long)
+                timestep = self.trg_step.index_select(0, tidx)
+                # next_timestep = self.trg_step.index_select(0, tidx)
+                # _, cond_x = self.denoise_step(xt, tidx-1)
+                logits = model.inference(xt, timestep, temperature)
+
+                a = compute_alpha(self.betas, timestep)
+                pred_eps = model.decoder_output(logits).sample()
+                # pred_eps = (xt - pred_x0.sample() * a.sqrt()) / (1 - a).sqrt()
+
+                xs, x0_t = self.denoise_step(xt, tidx, eps=pred_eps)
+                xs_list.append(xs.clone())
                 x0_list.append(x0_t)
+                xt = xs
 
-        return xs_list, x0_list
+        # return xs_list, x0_list
+        return xs_list[-1]
 
     def test(self):
         pass

@@ -33,7 +33,7 @@
                 "--root",
                 "output",
                 "--save",
-                "celeba_distill",
+                "celeba_distill_v0.3",
                 "--dataset",
                 "celeba_64",
                 "--num_channels_enc",
@@ -67,12 +67,12 @@
                 "--num_nf",
                 "1",
                 "--ada_groups",
-                // "--num_process_per_node", "2",
-                "--num_process_per_node",
-                "2",
+                "--num_process_per_node", "4",
+                // "--num_process_per_node", "1",
                 "--use_se",
                 "--res_dist",
-                "--fast_adamax"
+                "--fast_adamax",
+                // "--cont_training",
             ]
         },
     ]

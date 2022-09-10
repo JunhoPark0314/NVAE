@@ -23,53 +23,6 @@ from thirdparty.inplaced_sync_batchnorm import SyncBatchNormSwish
 
 CHANNEL_MULT = 2
 
-class FullyConnectedLayer(torch.nn.Module):
-    def __init__(self,
-        in_features,                # Number of input features.
-        out_features,               # Number of output features.
-        activation      = True,     # Activation function: 'relu', 'lrelu', etc.
-        bias            = True,     # Apply additive bias before the activation function?
-        lr_multiplier   = 1,        # Learning rate multiplier.
-        weight_init     = 1,        # Initial standard deviation of the weight tensor.
-        bias_init       = 0,        # Initial value of the additive bias.
-    ):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.activation = activation
-        self.weight = torch.nn.Parameter(torch.randn([out_features, in_features]) * (weight_init / lr_multiplier))
-        bias_init = np.broadcast_to(np.asarray(bias_init, dtype=np.float32), [out_features])
-        self.bias = torch.nn.Parameter(torch.from_numpy(bias_init / lr_multiplier)) if bias else None
-        self.weight_gain = lr_multiplier / np.sqrt(in_features)
-        self.bias_gain = lr_multiplier
-
-    def forward(self, x):
-        w = self.weight.to(x.dtype) * self.weight_gain
-        b = self.bias
-        if b is not None:
-            b = b.to(x.dtype)
-            if self.bias_gain != 1:
-                b = b * self.bias_gain
-        if self.activation:
-            x = x.matmul(w.t())
-            x = nn.SiLU()(x + b)
-        else:
-            x = torch.addmm(b.unsqueeze(0), x, w.t())
-        return x
-
-class TcondCell(nn.Module):
-    def __init__(self, t_dim, Cout, conv):
-        super().__init__()
-        self.conv = conv
-        self.t_shift = FullyConnectedLayer(t_dim, Cout, weight_init=0.1)
-        self.t_scale = FullyConnectedLayer(t_dim, Cout, bias_init=-1, weight_init=0.1)
-
-    def forward(self, x, temb):
-        x = self.conv(x)
-        t_scale = self.t_scale(temb)[:,:,None,None]
-        t_shift = self.t_shift(temb)[:,:,None,None]
-        out = x * t_scale.sigmoid() + t_shift
-        return out
 
 class Cell(nn.Module):
     def __init__(self, Cin, Cout, cell_type, arch, use_se, t_dim=None):
@@ -80,8 +33,8 @@ class Cell(nn.Module):
         stride = get_stride_for_cell_type(self.cell_type)
         self.skip = get_skip_connection(Cin, stride, affine=False, channel_mult=CHANNEL_MULT)
         if self.t_dim is not None: 
-            self.t_shift = FullyConnectedLayer(t_dim, Cin, weight_init=0.1)
-            self.t_scale = FullyConnectedLayer(t_dim, Cin, bias_init=-1, weight_init=0.1)
+            self.t_proj = nn.Linear(t_dim, Cin)
+            self.t_alpha = nn.parameter.Parameter(torch.ones([1,Cin,1,1]) * -1)
         self.use_se = use_se
         self._num_nodes = len(arch)
         self._ops = nn.ModuleList()
@@ -101,9 +54,8 @@ class Cell(nn.Module):
         skip = self.skip(s)
 
         if self.t_dim is not None:
-            t_scale = self.t_scale(temb)[:,:,None,None]
-            t_shift = self.t_shift(temb)[:,:,None,None]
-            s = s * t_scale.sigmoid() + t_shift
+            t_proj = nn.SiLU()(self.t_proj(temb))[:,:,None,None]
+            s = s + t_proj * self.t_alpha.sigmoid()
 
         for i in range(self._num_nodes):
             s = self._ops[i](s)
@@ -321,7 +273,6 @@ class AutoEncoder(nn.Module):
                 # build mu, sigma generator for encoder
                 num_c = int(self.num_channels_enc * mult)
                 cell = Conv2D(num_c, 2 * self.num_latent_per_group, kernel_size=3, padding=1, bias=True)
-                cell = TcondCell(self.t_dim, 2 * self.num_latent_per_group, cell)
                 enc_sampler.append(cell)
                 # build NF
                 for n in range(self.num_flows):
@@ -331,8 +282,9 @@ class AutoEncoder(nn.Module):
                     nf_cells.append(PairedCellAR(self.num_latent_per_group, num_c1, num_c2, arch))
                 if not (s == 0 and g == 0):  # for the first group, we use a fixed standard Normal.
                     num_c = int(self.num_channels_dec * mult)
-                    cell = Conv2D(num_c, 2 * self.num_latent_per_group, kernel_size=1, padding=0, bias=True)
-                    cell = TcondCell(self.t_dim, 2 * self.num_latent_per_group, cell)
+                    cell = nn.Sequential(
+                        nn.ELU(),
+                        Conv2D(num_c, 2 * self.num_latent_per_group, kernel_size=1, padding=0, bias=True))
                     dec_sampler.append(cell)
 
             mult = mult / CHANNEL_MULT
@@ -423,7 +375,7 @@ class AutoEncoder(nn.Module):
 
         idx_dec = 0
         ftr = self.enc0(s)                            # this reduces the channel dimension
-        param0 = self.enc_sampler[idx_dec](ftr, temb)
+        param0 = self.enc_sampler[idx_dec](ftr)
         mu_q, log_sig_q = torch.chunk(param0, 2, dim=1)
         dist = Normal(mu_q, log_sig_q)   # for the first approx. posterior
         z, _ = dist.sample()
@@ -455,12 +407,12 @@ class AutoEncoder(nn.Module):
             if cell.cell_type == 'combiner_dec':
                 if idx_dec > 0:
                     # form prior
-                    param = self.dec_sampler[idx_dec - 1](nn.ELU()(s), temb)
+                    param = self.dec_sampler[idx_dec - 1](s)
                     mu_p, log_sig_p = torch.chunk(param, 2, dim=1)
 
                     # form encoder
                     ftr = combiner_cells_enc[idx_dec - 1](combiner_cells_s[idx_dec - 1], s)
-                    param = self.enc_sampler[idx_dec](ftr, temb)
+                    param = self.enc_sampler[idx_dec](ftr)
                     mu_q, log_sig_q = torch.chunk(param, 2, dim=1)
                     dist = Normal(mu_p + mu_q, log_sig_p + log_sig_q) if self.res_dist else Normal(mu_q, log_sig_q)
                     z, _ = dist.sample()
@@ -534,7 +486,7 @@ class AutoEncoder(nn.Module):
             if cell.cell_type == 'combiner_dec':
                 if idx_dec > 0:
                     # form prior
-                    param = self.dec_sampler[idx_dec - 1](nn.ELU()(s), temb)
+                    param = self.dec_sampler[idx_dec - 1](s)
                     mu, log_sigma = torch.chunk(param, 2, dim=1)
                     dist = Normal(mu, log_sigma, temperature)
                     z, _ = dist.sample()

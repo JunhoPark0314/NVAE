@@ -50,5 +50,5 @@ optim:
   grad_clip: 1.0
 
 variable:
-  timesteps: 8
+  timesteps: 5
   pretrained: 'output/pretrained/ddim/celeba.pth'

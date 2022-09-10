@@ -238,7 +238,6 @@ class UpSample(nn.Module):
     def forward(self, x):
         return F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=True)
 
-
 class EncCombinerCell(nn.Module):
     def __init__(self, Cin1, Cin2, Cout, cell_type):
         super(EncCombinerCell, self).__init__()
