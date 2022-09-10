@@ -5,6 +5,7 @@
 # for NVAE. To view a copy of this license, see the LICENSE file.
 # ---------------------------------------------------------------
 
+from diffusion_model import FullyConnectedLayer
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -239,28 +240,45 @@ class UpSample(nn.Module):
         return F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=True)
 
 class EncCombinerCell(nn.Module):
-    def __init__(self, Cin1, Cin2, Cout, cell_type):
+    def __init__(self, Cin1, Cin2, Cout, cell_type, t_dim=None):
         super(EncCombinerCell, self).__init__()
         self.cell_type = cell_type
         # Cin = Cin1 + Cin2
         self.conv = Conv2D(Cin2, Cout, kernel_size=1, stride=1, padding=0, bias=True)
+        self.t_dim = t_dim
+        if self.t_dim is not None: 
+            self.t_shift = FullyConnectedLayer(t_dim, Cout, weight_init=0.01)
+            self.t_scale = FullyConnectedLayer(t_dim, Cout, weight_init=0.01)
 
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, temb):
         x2 = self.conv(x2)
         out = x1 + x2
+        if self.t_dim is not None:
+            t_scale = self.t_scale(temb)[:,:,None,None]
+            t_shift = self.t_shift(temb)[:,:,None,None]
+            out = out * (1 + t_scale.tanh()) + t_shift
+
         return out
 
 
 # original combiner
 class DecCombinerCell(nn.Module):
-    def __init__(self, Cin1, Cin2, Cout, cell_type):
+    def __init__(self, Cin1, Cin2, Cout, cell_type, t_dim=None):
         super(DecCombinerCell, self).__init__()
         self.cell_type = cell_type
         self.conv = Conv2D(Cin1 + Cin2, Cout, kernel_size=1, stride=1, padding=0, bias=True)
+        self.t_dim = t_dim
+        if self.t_dim is not None: 
+            self.t_shift = FullyConnectedLayer(t_dim, Cout, weight_init=0.01)
+            self.t_scale = FullyConnectedLayer(t_dim, Cout, weight_init=0.01)
 
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, temb):
         out = torch.cat([x1, x2], dim=1)
         out = self.conv(out)
+        if self.t_dim is not None:
+            t_scale = self.t_scale(temb)[:,:,None,None]
+            t_shift = self.t_shift(temb)[:,:,None,None]
+            out = out * (1 + t_scale.tanh()) + t_shift
         return out
 
 

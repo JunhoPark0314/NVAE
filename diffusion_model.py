@@ -225,9 +225,9 @@ class AutoEncoder(nn.Module):
             self.dec_tower = []
             self.stem_decoder = Conv2D(self.num_latent_per_group, mult * self.num_channels_enc, (1, 1), bias=True)
         else:
-            self.dec_tower, mult = self.init_decoder_tower(mult)
+            self.dec_tower, self.dec_skip_tower, mult = self.init_decoder_tower(mult)
 
-        self.post_process, mult = self.init_post_process(mult)
+        self.post_process, self.post_skip_tower, mult = self.init_post_process(mult)
 
         self.image_conditional = self.init_image_conditional(mult)
 
@@ -252,14 +252,14 @@ class AutoEncoder(nn.Module):
         self.num_power_iter = 4
         self.unet_enc = DenoiserEncoder(denoiser_config) 
 
-        st_res = 64
-        enc_ch = self.num_channels_enc
-        for i in range(self.num_latent_scales+1):
-            cell = Conv2D(enc_ch, enc_ch, kernel_size=1, padding=0, bias=True)
-            cell = TcondCell(self.t_dim, enc_ch, cell, bias_init=-2)
-            setattr(self, f'unet_tcond_{st_res}', cell)
-            enc_ch *= CHANNEL_MULT
-            st_res //= CHANNEL_MULT
+        # st_res = 64
+        # enc_ch = self.num_channels_enc
+        # for i in range(self.num_latent_scales+1):
+        #     cell = Conv2D(enc_ch, enc_ch, kernel_size=1, padding=0, bias=True)
+        #     cell = TcondCell(self.t_dim, enc_ch, cell, bias_init=-2)
+        #     setattr(self, f'unet_tcond_{st_res}', cell)
+        #     enc_ch *= CHANNEL_MULT
+        #     st_res //= CHANNEL_MULT
 
     def init_stem(self):
         Cout = self.num_channels_enc
@@ -300,7 +300,7 @@ class AutoEncoder(nn.Module):
                 if not (s == self.num_latent_scales - 1 and g == self.groups_per_scale[s] - 1):
                     num_ce = int(self.num_channels_enc * mult)
                     num_cd = int(self.num_channels_dec * mult)
-                    cell = EncCombinerCell(num_ce, num_cd, num_ce, cell_type='combiner_enc')
+                    cell = EncCombinerCell(num_ce, num_cd, num_ce, cell_type='combiner_enc', t_dim=self.t_dim, t_dim=self.t_dim)
                     enc_tower.append(cell)
 
             # down cells after finishing a scale
@@ -351,6 +351,7 @@ class AutoEncoder(nn.Module):
     def init_decoder_tower(self, mult):
         # create decoder tower
         dec_tower = nn.ModuleList()
+        skip_tower = nn.ModuleList()
         for s in range(self.num_latent_scales):
             for g in range(self.groups_per_scale[self.num_latent_scales - s - 1]):
                 num_c = int(self.num_channels_dec * mult)
@@ -360,8 +361,12 @@ class AutoEncoder(nn.Module):
                         cell = Cell(num_c, num_c, t_dim=self.t_dim, cell_type='normal_dec', arch=arch, use_se=self.use_se)
                         dec_tower.append(cell)
 
-                cell = DecCombinerCell(num_c, self.num_latent_per_group, num_c, cell_type='combiner_dec')
+                cell = DecCombinerCell(num_c, self.num_latent_per_group, num_c, cell_type='combiner_dec', t_dim=self.t_dim)
                 dec_tower.append(cell)
+
+                cell = Conv2D(num_c, num_c, kernel_size=1, padding=0, bias=True)
+                cell = TcondCell(self.t_dim, num_c, cell, bias_init=-2)
+                skip_tower.append(cell)
 
             # down cells after finishing a scale
             if s < self.num_latent_scales - 1:
@@ -370,12 +375,18 @@ class AutoEncoder(nn.Module):
                 num_co = int(num_ci / CHANNEL_MULT)
                 cell = Cell(num_ci, num_co, t_dim=self.t_dim, cell_type='up_dec', arch=arch, use_se=self.use_se)
                 dec_tower.append(cell)
+
+                cell = Conv2D(num_co, num_co, kernel_size=1, padding=0, bias=True)
+                cell = TcondCell(self.t_dim, num_co, cell, bias_init=-2)
+                skip_tower.append(cell)
+
                 mult = mult / CHANNEL_MULT
 
-        return dec_tower, mult
+        return dec_tower, skip_tower, mult
 
     def init_post_process(self, mult):
         post_process = nn.ModuleList()
+        skip_tower = nn.ModuleList()
         for b in range(self.num_postprocess_blocks):
             for c in range(self.num_postprocess_cells):
                 if c == 0:
@@ -384,6 +395,8 @@ class AutoEncoder(nn.Module):
                     num_co = int(num_ci / CHANNEL_MULT)
                     cell = Cell(num_ci, num_co, cell_type='up_post', arch=arch, use_se=self.use_se)
                     mult = mult / CHANNEL_MULT
+
+                    num_c = num_co
                 else:
                     arch = self.arch_instance['normal_post']
                     num_c = int(self.num_channels_dec * mult)
@@ -391,7 +404,11 @@ class AutoEncoder(nn.Module):
 
                 post_process.append(cell)
 
-        return post_process, mult
+                cell = Conv2D(num_c, num_c, kernel_size=1, padding=0, bias=True)
+                cell = TcondCell(self.t_dim, num_c, cell, bias_init=-2)
+                skip_tower.append(cell)
+
+        return post_process, skip_tower, mult
 
     def init_image_conditional(self, mult):
         C_in = int(self.num_channels_dec * mult)
@@ -459,8 +476,8 @@ class AutoEncoder(nn.Module):
         idx_dec = 0
         s = self.prior_ftr0.unsqueeze(0)
         batch_size = z.size(0)
-        s = s.expand(batch_size, -1, -1, -1) + getattr(self, f'unet_tcond_{s.shape[2]}')(hs.pop(), temb)
-        for cell in self.dec_tower:
+        s = s.expand(batch_size, -1, -1, -1) + hs.pop()
+        for cell, skip_cell in zip(self.dec_tower, self.dec_skip_tower):
             if cell.cell_type == 'combiner_dec':
                 if idx_dec > 0:
                     # form prior
@@ -468,7 +485,7 @@ class AutoEncoder(nn.Module):
                     mu_p, log_sig_p = torch.chunk(param, 2, dim=1)
 
                     # form encoder
-                    ftr = combiner_cells_enc[idx_dec - 1](combiner_cells_s[idx_dec - 1], s)
+                    ftr = combiner_cells_enc[idx_dec - 1](combiner_cells_s[idx_dec - 1], s, temb)
                     param = self.enc_sampler[idx_dec](ftr, temb)
                     mu_q, log_sig_q = torch.chunk(param, 2, dim=1)
                     dist = Normal(mu_p + mu_q, log_sig_p + log_sig_q) if self.res_dist else Normal(mu_q, log_sig_q)
@@ -489,20 +506,16 @@ class AutoEncoder(nn.Module):
                     all_log_p.append(log_p_conv)
 
                 # 'combiner_dec'
-                s = cell(s, z)
+                s = cell(s, z, temb) + skip_cell(hs.pop(), temb)
                 idx_dec += 1
             else:
-                s = cell(s, temb)
-                if cell.cell_type == 'up_dec':
-                    s += getattr(self,f'unet_tcond_{s.shape[2]}')(hs.pop(), temb)
+                s = cell(s, temb) + skip_cell(hs.pop(), temb)
         
         if self.vanilla_vae:
             s = self.stem_decoder(z)
 
-        for cell in self.post_process:
-            s = cell(s)
-            if cell.cell_type == 'up_post':
-                s += getattr(self,f'unet_tcond_{s.shape[2]}')(hs.pop(), temb)
+        for cell, skip_cell in zip(self.post_process, self.post_skip_tower):
+            s = cell(s) + skip_cell(hs.pop(), temb)
 
         assert not hs
 
@@ -539,7 +552,7 @@ class AutoEncoder(nn.Module):
         s = self.prior_ftr0.unsqueeze(0)
         batch_size = z.size(0)
         s = s.expand(batch_size, -1, -1, -1) + getattr(self,f'unet_tcond_{s.shape[2]}')(hs.pop(), temb)
-        for cell in self.dec_tower:
+        for cell, skip_cell in zip(self.dec_tower, self.dec_skip_tower):
             if cell.cell_type == 'combiner_dec':
                 if idx_dec > 0:
                     # form prior
@@ -549,21 +562,18 @@ class AutoEncoder(nn.Module):
                     z, _ = dist.sample()
 
                 # 'combiner_dec'
-                s = cell(s, z)
+                s = cell(s, z, temb) + skip_cell(hs.pop(), temb)
                 idx_dec += 1
             else:
-                s = cell(s, temb)
-                if cell.cell_type == 'up_dec':
-                    scale_ind += 1
-                    s += getattr(self,f'unet_tcond_{s.shape[2]}')(hs.pop(), temb)
+                s = cell(s, temb) + skip_cell(hs.pop(), temb)
 
         if self.vanilla_vae:
             s = self.stem_decoder(z)
 
-        for cell in self.post_process:
-            s = cell(s)
-            if cell.cell_type == 'up_post':
-                s += getattr(self,f'unet_tcond_{s.shape[2]}')(hs.pop(), temb)
+        for cell, skip_cell in zip(self.post_process, self.post_skip_tower):
+            s = cell(s) + skip_cell(hs.pop(), temb)
+
+        assert not hs
 
         logits = self.image_conditional(s)
         return logits
