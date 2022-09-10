@@ -58,11 +58,11 @@ class FullyConnectedLayer(torch.nn.Module):
         return x
 
 class TcondCell(nn.Module):
-    def __init__(self, t_dim, Cout, conv):
+    def __init__(self, t_dim, Cout, conv, bias_init=-1):
         super().__init__()
         self.conv = conv
         self.t_shift = FullyConnectedLayer(t_dim, Cout, weight_init=0.1)
-        self.t_scale = FullyConnectedLayer(t_dim, Cout, bias_init=-1, weight_init=0.1)
+        self.t_scale = FullyConnectedLayer(t_dim, Cout, bias_init=bias_init, weight_init=0.1)
 
     def forward(self, x, temb):
         x = self.conv(x)
@@ -251,6 +251,15 @@ class AutoEncoder(nn.Module):
         self.sr_v = {}
         self.num_power_iter = 4
         self.unet_enc = DenoiserEncoder(denoiser_config) 
+
+        st_res = 64
+        enc_ch = self.num_channels_enc
+        for i in range(self.num_latent_scales+1):
+            cell = Conv2D(enc_ch, enc_ch, kernel_size=1, padding=0, bias=True)
+            cell = TcondCell(self.t_dim, enc_ch, cell, bias_init=-2)
+            setattr(self, f'unet_tcond_{st_res}', cell)
+            enc_ch *= CHANNEL_MULT
+            st_res //= CHANNEL_MULT
 
     def init_stem(self):
         Cout = self.num_channels_enc
@@ -450,7 +459,7 @@ class AutoEncoder(nn.Module):
         idx_dec = 0
         s = self.prior_ftr0.unsqueeze(0)
         batch_size = z.size(0)
-        s = s.expand(batch_size, -1, -1, -1) + hs.pop()
+        s = s.expand(batch_size, -1, -1, -1) + getattr(self, f'unet_tcond_{s.shape[2]}')(hs.pop(), temb)
         for cell in self.dec_tower:
             if cell.cell_type == 'combiner_dec':
                 if idx_dec > 0:
@@ -485,7 +494,7 @@ class AutoEncoder(nn.Module):
             else:
                 s = cell(s, temb)
                 if cell.cell_type == 'up_dec':
-                    s += hs.pop()
+                    s += getattr(self,f'unet_tcond_{s.shape[2]}')(hs.pop(), temb)
         
         if self.vanilla_vae:
             s = self.stem_decoder(z)
@@ -493,7 +502,7 @@ class AutoEncoder(nn.Module):
         for cell in self.post_process:
             s = cell(s)
             if cell.cell_type == 'up_post':
-                s += hs.pop()
+                s += getattr(self,f'unet_tcond_{s.shape[2]}')(hs.pop(), temb)
 
         assert not hs
 
@@ -529,7 +538,7 @@ class AutoEncoder(nn.Module):
         idx_dec = 0
         s = self.prior_ftr0.unsqueeze(0)
         batch_size = z.size(0)
-        s = s.expand(batch_size, -1, -1, -1) + hs.pop()
+        s = s.expand(batch_size, -1, -1, -1) + getattr(self,f'unet_tcond_{s.shape[2]}')(hs.pop(), temb)
         for cell in self.dec_tower:
             if cell.cell_type == 'combiner_dec':
                 if idx_dec > 0:
@@ -546,7 +555,7 @@ class AutoEncoder(nn.Module):
                 s = cell(s, temb)
                 if cell.cell_type == 'up_dec':
                     scale_ind += 1
-                    s += hs.pop()
+                    s += getattr(self,f'unet_tcond_{s.shape[2]}')(hs.pop(), temb)
 
         if self.vanilla_vae:
             s = self.stem_decoder(z)
@@ -554,7 +563,7 @@ class AutoEncoder(nn.Module):
         for cell in self.post_process:
             s = cell(s)
             if cell.cell_type == 'up_post':
-                s += hs.pop()
+                s += getattr(self,f'unet_tcond_{s.shape[2]}')(hs.pop(), temb)
 
         logits = self.image_conditional(s)
         return logits
