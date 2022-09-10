@@ -66,6 +66,7 @@ def main(args):
     enc_config = deepcopy(ddim_config)
     # enc_config.model.in_channels=6
     enc_config.model.ch = 32
+    enc_config.model.num_res_blocks = 3
     enc_config.model.ch_mult = [1, 2, 4, 8]
 
     # TODO: change autoencoer to Denoising Variational Autoencoder

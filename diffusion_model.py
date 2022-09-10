@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ddim.model import DenoiserEncoder, get_timestep_embedding
-from neural_operations import OPS, EncCombinerCell, DecCombinerCell, Conv2D, get_skip_connection, SE
+from neural_operations import OPS, EncCombinerCell, DecCombinerCell, Conv2D, get_skip_connection, SE, FullyConnectedLayer
 from neural_ar_operations import ARConv2d, ARInvertedResidual, MixLogCDFParam, mix_log_cdf_flow
 from neural_ar_operations import ELUConv as ARELUConv
 from torch.distributions.bernoulli import Bernoulli
@@ -22,40 +22,6 @@ from distributions import Normal, DiscMixLogistic, NormalDecoder
 from thirdparty.inplaced_sync_batchnorm import SyncBatchNormSwish
 
 CHANNEL_MULT = 2
-
-class FullyConnectedLayer(torch.nn.Module):
-    def __init__(self,
-        in_features,                # Number of input features.
-        out_features,               # Number of output features.
-        activation      = True,     # Activation function: 'relu', 'lrelu', etc.
-        bias            = True,     # Apply additive bias before the activation function?
-        lr_multiplier   = 1,        # Learning rate multiplier.
-        weight_init     = 1,        # Initial standard deviation of the weight tensor.
-        bias_init       = 0,        # Initial value of the additive bias.
-    ):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.activation = activation
-        self.weight = torch.nn.Parameter(torch.randn([out_features, in_features]) * (weight_init / lr_multiplier))
-        bias_init = np.broadcast_to(np.asarray(bias_init, dtype=np.float32), [out_features])
-        self.bias = torch.nn.Parameter(torch.from_numpy(bias_init / lr_multiplier)) if bias else None
-        self.weight_gain = lr_multiplier / np.sqrt(in_features)
-        self.bias_gain = lr_multiplier
-
-    def forward(self, x):
-        w = self.weight.to(x.dtype) * self.weight_gain
-        b = self.bias
-        if b is not None:
-            b = b.to(x.dtype)
-            if self.bias_gain != 1:
-                b = b * self.bias_gain
-        if self.activation:
-            x = x.matmul(w.t())
-            x = nn.SiLU()(x + b)
-        else:
-            x = torch.addmm(b.unsqueeze(0), x, w.t())
-        return x
 
 class TcondCell(nn.Module):
     def __init__(self, t_dim, Cout, conv, bias_init=-1):
@@ -300,7 +266,7 @@ class AutoEncoder(nn.Module):
                 if not (s == self.num_latent_scales - 1 and g == self.groups_per_scale[s] - 1):
                     num_ce = int(self.num_channels_enc * mult)
                     num_cd = int(self.num_channels_dec * mult)
-                    cell = EncCombinerCell(num_ce, num_cd, num_ce, cell_type='combiner_enc', t_dim=self.t_dim, t_dim=self.t_dim)
+                    cell = EncCombinerCell(num_ce, num_cd, num_ce, cell_type='combiner_enc', t_dim=self.t_dim)
                     enc_tower.append(cell)
 
             # down cells after finishing a scale
@@ -360,6 +326,7 @@ class AutoEncoder(nn.Module):
                         arch = self.arch_instance['normal_dec']
                         cell = Cell(num_c, num_c, t_dim=self.t_dim, cell_type='normal_dec', arch=arch, use_se=self.use_se)
                         dec_tower.append(cell)
+                        skip_tower.append(nn.Identity())
 
                 cell = DecCombinerCell(num_c, self.num_latent_per_group, num_c, cell_type='combiner_dec', t_dim=self.t_dim)
                 dec_tower.append(cell)
@@ -382,6 +349,7 @@ class AutoEncoder(nn.Module):
 
                 mult = mult / CHANNEL_MULT
 
+        assert len(dec_tower) == len(skip_tower)
         return dec_tower, skip_tower, mult
 
     def init_post_process(self, mult):
@@ -425,8 +393,6 @@ class AutoEncoder(nn.Module):
     def forward(self, trg_x, prev_x, timestep):
         temb = get_timestep_embedding(timestep, self.t_dim)
         hs = self.unet_enc(prev_x, timestep)
-        # hs = [0] * 4
-
         s = self.stem(trg_x)
 
         # perform pre-processing
@@ -477,6 +443,7 @@ class AutoEncoder(nn.Module):
         s = self.prior_ftr0.unsqueeze(0)
         batch_size = z.size(0)
         s = s.expand(batch_size, -1, -1, -1) + hs.pop()
+
         for cell, skip_cell in zip(self.dec_tower, self.dec_skip_tower):
             if cell.cell_type == 'combiner_dec':
                 if idx_dec > 0:
@@ -506,10 +473,16 @@ class AutoEncoder(nn.Module):
                     all_log_p.append(log_p_conv)
 
                 # 'combiner_dec'
-                s = cell(s, z, temb) + skip_cell(hs.pop(), temb)
+                skip = hs.pop()
+                s = cell(s, z, temb) + skip_cell(skip, temb)
                 idx_dec += 1
             else:
-                s = cell(s, temb) + skip_cell(hs.pop(), temb)
+                if cell.cell_type == 'up_dec':
+                    skip = hs.pop()
+                    skip = skip_cell(skip, temb)
+                else:
+                    skip = 0
+                s = cell(s, temb) + skip
         
         if self.vanilla_vae:
             s = self.stem_decoder(z)
@@ -543,6 +516,7 @@ class AutoEncoder(nn.Module):
         temb = get_timestep_embedding(timestep, self.t_dim)
         hs = self.unet_enc(prev_x, timestep)
 
+
         scale_ind = 0
         z0_size = [num_samples] + self.z0_size
         dist = Normal(mu=torch.zeros(z0_size).cuda(), log_sigma=torch.zeros(z0_size).cuda(), temp=temperature)
@@ -565,7 +539,12 @@ class AutoEncoder(nn.Module):
                 s = cell(s, z, temb) + skip_cell(hs.pop(), temb)
                 idx_dec += 1
             else:
-                s = cell(s, temb) + skip_cell(hs.pop(), temb)
+                if cell.cell_type == 'up_dec':
+                    skip = hs.pop()
+                    skip = skip_cell(skip, temb)
+                else:
+                    skip = 0
+                s = cell(s, temb) + skip
 
         if self.vanilla_vae:
             s = self.stem_decoder(z)

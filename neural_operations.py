@@ -5,10 +5,10 @@
 # for NVAE. To view a copy of this license, see the LICENSE file.
 # ---------------------------------------------------------------
 
-from diffusion_model import FullyConnectedLayer
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 from thirdparty.swish import Swish as SwishFN
 from thirdparty.inplaced_sync_batchnorm import SyncBatchNormSwish
@@ -29,6 +29,40 @@ OPS = OrderedDict([
     ('mconv_e3k5g8', lambda Cin, Cout, stride: InvertedResidual(Cin, Cout, stride, ex=3, dil=1, k=5, g=8)),
     ('mconv_e6k11g0', lambda Cin, Cout, stride: InvertedResidual(Cin, Cout, stride, ex=6, dil=1, k=11, g=0)),
 ])
+
+class FullyConnectedLayer(torch.nn.Module):
+    def __init__(self,
+        in_features,                # Number of input features.
+        out_features,               # Number of output features.
+        activation      = True,     # Activation function: 'relu', 'lrelu', etc.
+        bias            = True,     # Apply additive bias before the activation function?
+        lr_multiplier   = 1,        # Learning rate multiplier.
+        weight_init     = 1,        # Initial standard deviation of the weight tensor.
+        bias_init       = 0,        # Initial value of the additive bias.
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.activation = activation
+        self.weight = torch.nn.Parameter(torch.randn([out_features, in_features]) * (weight_init / lr_multiplier))
+        bias_init = np.broadcast_to(np.asarray(bias_init, dtype=np.float32), [out_features])
+        self.bias = torch.nn.Parameter(torch.from_numpy(bias_init / lr_multiplier)) if bias else None
+        self.weight_gain = lr_multiplier / np.sqrt(in_features)
+        self.bias_gain = lr_multiplier
+
+    def forward(self, x):
+        w = self.weight.to(x.dtype) * self.weight_gain
+        b = self.bias
+        if b is not None:
+            b = b.to(x.dtype)
+            if self.bias_gain != 1:
+                b = b * self.bias_gain
+        if self.activation:
+            x = x.matmul(w.t())
+            x = nn.SiLU()(x + b)
+        else:
+            x = torch.addmm(b.unsqueeze(0), x, w.t())
+        return x
 
 
 def get_skip_connection(C, stride, affine, channel_mult):

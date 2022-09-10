@@ -434,6 +434,7 @@ class DenoiserEncoder(nn.Module):
                 if len(self.down[i_level].attn) > 0:
                     h = self.down[i_level].attn[i_block](h)
                 hs.append(h)
+                skip.append(h)
                 # if (i_block == self.num_res_blocks-1) and (i_level != self.num_resolutions-1):
                 #     skip.append(h)
             if i_level != self.num_resolutions-1:
@@ -446,6 +447,6 @@ class DenoiserEncoder(nn.Module):
         h = self.mid.block_2(h, temb)
 
         # skip.append(h)
-        skip = hs + [h]
+        skip = skip[:-1] + [h]
 
         return skip
