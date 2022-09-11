@@ -97,32 +97,36 @@ class Diffusion(object):
         self.trg_denoiser.eval()
 
         self.timesteps = config.variable.timesteps
-        skip = self.num_timesteps // (self.timesteps + 1)
-        self.trg_step = torch.arange(0, self.num_timesteps, skip, device=self.device)
+        self.step_size = self.num_timesteps // (self.timesteps + 1)
+        self.trg_step = torch.arange(0, self.num_timesteps, self.step_size, device=self.device)
 
         self.img_channels = config.model.in_channels
         self.img_size = config.data.image_size
 
     
     def antithetic_timestep_sample(self, N):
-        S = (len(self.trg_step) - 1)
-        return ((torch.arange(N) + (S * torch.rand(1)).floor().long()) % S).to(self.device)
+        t = torch.randint(
+            low=0, high=self.num_timesteps, size=(N // 2 + 1,)
+        ).to(self.device)
+        prev_t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:N]
+        next_t = torch.clip(prev_t - self.step_size, min=0, max=self.num_timesteps-1)
+        return prev_t, next_t
+
+        # S = (len(self.trg_step) - 1)
+        # ((torch.arange(N) + (S * torch.rand(1)).floor().long()) % S).to(self.device)
         # t = torch.arange(N).to(self.device) + self.timesteps * torch.rand(1).to(self.device)
-        # t = torch.randint(
-        #     low=0, high=self.timesteps, size=(N // 2 + 1,)
-        # ).to(self.device)
-        # t = torch.cat([t, self.timesteps - t - 1], dim=0)[:N] + 1
         # return t
 
-    def sample_noised(self, x, e, t):
-        step = self.trg_step.index_select(0, t)
+    def sample_noised(self, x, e, step):
+        # step = self.trg_step.index_select(0, t)
         a = compute_alpha(self.betas, step)
         return x * a.sqrt() + e * (1 - a).sqrt(), a
 
-    def denoise_step(self, noised, t, eps=None, **kwargs):
-        assert (t.max() < len(self.trg_step)).all().item() and (t.min() >=0).all().item()
-        step = self.trg_step.index_select(0, t)
-        next_step = self.trg_step.index_select(0, (t-1).clip(min=0))
+    def denoise_step(self, noised, step, eps=None, **kwargs):
+        # assert (t.max() < len(self.trg_step)).all().item() and (t.min() >=0).all().item()
+        # step = self.trg_step.index_select(0, t)
+        # next_step = self.trg_step.index_select(0, (t-1).clip(min=0))
+        next_step = torch.clip(step - kwargs.get("step_size", self.step_size), min=0, max=1000)
         at = compute_alpha(self.betas, step)
         at_next = compute_alpha(self.betas, next_step)
         # eps is distribution use sample and return distribution
@@ -156,14 +160,14 @@ class Diffusion(object):
                 tidx = ti * torch.ones(len(xt), device=self.device, dtype=torch.long)
                 timestep = self.trg_step.index_select(0, tidx)
                 # next_timestep = self.trg_step.index_select(0, tidx)
-                # _, cond_x = self.denoise_step(xt, tidx-1)
-                logits = model.inference(xt, timestep, temperature)
+                _, cond_x = self.denoise_step(xt, timestep)
+                logits = model.inference(cond_x, timestep, temperature)
 
                 a = compute_alpha(self.betas, timestep)
                 pred_x0 = model.decoder_output(logits, xt, a).sample()
                 pred_eps = (xt - pred_x0 * a.sqrt()) / (1 - a).sqrt()
 
-                xs, x0_t = self.denoise_step(xt, tidx, eps=pred_eps)
+                xs, x0_t = self.denoise_step(xt, timestep, eps=pred_eps)
                 xs_list.append(xs.clone())
                 x0_list.append(x0_t)
                 xt = xs

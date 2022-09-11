@@ -62,11 +62,12 @@ def main(args):
         ddim_config = yaml.safe_load(f)
     ddim_config = dict2namespace(ddim_config)
     denoiser = Diffusion(ddim_config)
+    denoiser = denoiser
 
     enc_config = deepcopy(ddim_config)
     # enc_config.model.in_channels=6
     enc_config.model.ch = 32
-    enc_config.model.num_res_blocks = 3
+    enc_config.model.num_res_blocks = 2
     enc_config.model.ch_mult = [1, 2, 4, 8]
 
     # TODO: change autoencoer to Denoising Variational Autoencoder
@@ -183,12 +184,12 @@ def train(train_queue, model, denoiser, cnn_optimizer, grad_scalar, global_step,
         x = utils.pre_process(x, args.num_x_bits, normalize=True)
 
         # TODO: sample prev_x, next_x, trg_x, timestep
-        tidx = denoiser.antithetic_timestep_sample(len(x))
-        timestep =  denoiser.trg_step.index_select(0, tidx)
-        prev_x, a_prev = denoiser.sample_noised(x, torch.randn_like(x), tidx+1)
-        next_x, a_next = denoiser.sample_noised(x, torch.randn_like(x), tidx)
-        # _, cond_x = denoiser.denoise_step(prev_x, tidx)
-        _, trg_x = denoiser.denoise_step(next_x, tidx)
+        prev_timestep, next_timestep = denoiser.antithetic_timestep_sample(len(x))
+        # timestep =  denoiser.trg_step.index_select(0, prev_time)
+        prev_x, a_prev = denoiser.sample_noised(x, torch.randn_like(x), prev_timestep)
+        next_x, a_next = denoiser.sample_noised(x, torch.randn_like(x), next_timestep)
+        _, cond_x = denoiser.denoise_step(prev_x, prev_timestep)
+        _, trg_x = denoiser.denoise_step(next_x, next_timestep)
         # trg_eps = (prev_x - trg_x * a_prev.sqrt()) / (1 - a_prev).sqrt()
 
         # warm-up lr
@@ -203,7 +204,7 @@ def train(train_queue, model, denoiser, cnn_optimizer, grad_scalar, global_step,
 
         cnn_optimizer.zero_grad()
         with autocast():
-            logits, log_q, log_p, kl_all, kl_diag = model(trg_x, prev_x, timestep)
+            logits, log_q, log_p, kl_all, kl_diag = model(trg_x, cond_x, prev_timestep)
 
             # TODO: assert pred_eps is NormalDecoder
 
