@@ -190,6 +190,7 @@ def train(train_queue, model, denoiser, cnn_optimizer, grad_scalar, global_step,
         next_x, a_next = denoiser.sample_noised(x, torch.randn_like(x), next_timestep)
         _, cond_x = denoiser.denoise_step(prev_x, prev_timestep)
         _, trg_x = denoiser.denoise_step(next_x, next_timestep)
+        trg_eps = trg_x - cond_x
         # trg_eps = (prev_x - trg_x * a_prev.sqrt()) / (1 - a_prev).sqrt()
 
         # warm-up lr
@@ -204,15 +205,15 @@ def train(train_queue, model, denoiser, cnn_optimizer, grad_scalar, global_step,
 
         cnn_optimizer.zero_grad()
         with autocast():
-            logits, log_q, log_p, kl_all, kl_diag = model(trg_x, cond_x, prev_timestep)
+            logits, log_q, log_p, kl_all, kl_diag = model(trg_eps, cond_x, prev_timestep)
 
             # TODO: assert pred_eps is NormalDecoder
 
-            pred_x0 = model.decoder_output(logits, prev_x, a_prev)
+            pred_eps = model.decoder_output(logits, prev_x, a_prev)
             kl_coeff = utils.kl_coeff(global_step, args.kl_anneal_portion * args.num_total_iter,
                                       args.kl_const_portion * args.num_total_iter, args.kl_const_coeff)
 
-            recon_loss = utils.reconstruction_loss(pred_x0, trg_x, crop=model.crop_output)
+            recon_loss = utils.reconstruction_loss(pred_eps, trg_eps, crop=model.crop_output)
             balanced_kl, kl_coeffs, kl_vals = utils.kl_balancer(kl_all, kl_coeff, kl_balance=True, alpha_i=alpha_i)
 
             nelbo_batch = recon_loss + balanced_kl
@@ -244,7 +245,7 @@ def train(train_queue, model, denoiser, cnn_optimizer, grad_scalar, global_step,
                 # pred_eps = (prev_x - pred_x0.sample() * a_prev.sqrt()) / (1 - a_prev).sqrt()
                 # _, output_img = denoiser.denoise_step(prev_x, tidx, eps=pred_eps)
                 # output_img = (prev_x - (1 - a_prev).sqrt() * pred_eps.sample()) / a_prev.sqrt()
-                output_img = pred_x0.sample()
+                output_img = pred_eps.sample() + cond_x
 
                 output_img = output_img[:n*n]
                 prev_tiled = utils.tile_image(prev_x[:n*n], n)
@@ -266,7 +267,7 @@ def train(train_queue, model, denoiser, cnn_optimizer, grad_scalar, global_step,
                               'param_groups'][0]['lr'], global_step)
             writer.add_scalar('train/nelbo_iter', loss, global_step)
             writer.add_scalar('train/kl_iter', torch.mean(sum(kl_all)), global_step)
-            writer.add_scalar('train/recon_iter', torch.mean(utils.reconstruction_loss(pred_x0, trg_x, crop=model.crop_output)), global_step)
+            writer.add_scalar('train/recon_iter', torch.mean(utils.reconstruction_loss(pred_eps, trg_eps, crop=model.crop_output)), global_step)
             writer.add_scalar('kl_coeff/coeff', kl_coeff, global_step)
             total_active = 0
             for i, kl_diag_i in enumerate(kl_diag):

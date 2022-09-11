@@ -164,7 +164,8 @@ class Diffusion(object):
                 logits = model.inference(cond_x, timestep, temperature)
 
                 a = compute_alpha(self.betas, timestep)
-                pred_x0 = model.decoder_output(logits, xt, a).sample()
+                pred_diff = model.decoder_output(logits, xt, a).sample()
+                pred_x0 = cond_x + pred_diff
                 pred_eps = (xt - pred_x0 * a.sqrt()) / (1 - a).sqrt()
 
                 xs, x0_t = self.denoise_step(xt, timestep, eps=pred_eps)
