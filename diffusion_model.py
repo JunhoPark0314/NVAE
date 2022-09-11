@@ -558,9 +558,9 @@ class AutoEncoder(nn.Module):
         return logits
 
     def decoder_output(self, logits, prev_x, a_prev):
-        mu, sigma = torch.chunk(logits, logits.shape[1]//2, 1)
-        new_mu = (prev_x - mu * (1 - a_prev).sqrt()) / a_prev.sqrt()
-        logits = torch.cat([new_mu, sigma], 1)
+        #mu, sigma = torch.chunk(logits, 2, 1)
+        #new_mu = (prev_x - mu * (1 - a_prev).sqrt()) / a_prev.sqrt()
+        #logits = torch.cat([new_mu, sigma], 1)
         if self.dataset in {'mnist', 'omniglot'}:
             return Bernoulli(logits=logits)
         elif self.dataset in {'stacked_mnist', 'cifar10', 'celeba_64', 'celeba_256', 'imagenet_32', 'imagenet_64', 'ffhq',

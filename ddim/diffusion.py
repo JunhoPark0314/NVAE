@@ -161,7 +161,7 @@ class Diffusion(object):
 
                 a = compute_alpha(self.betas, timestep)
                 pred_x0 = model.decoder_output(logits, xt, a).sample()
-                pred_eps = (xt - pred_x0.sample() * a.sqrt()) / (1 - a).sqrt()
+                pred_eps = (xt - pred_x0 * a.sqrt()) / (1 - a).sqrt()
 
                 xs, x0_t = self.denoise_step(xt, tidx, eps=pred_eps)
                 xs_list.append(xs.clone())
