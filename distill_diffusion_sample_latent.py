@@ -62,12 +62,11 @@ def main(args):
         ddim_config = yaml.safe_load(f)
     ddim_config = dict2namespace(ddim_config)
     denoiser = Diffusion(ddim_config)
-    denoiser = denoiser
 
     enc_config = deepcopy(ddim_config)
     # enc_config.model.in_channels=6
     enc_config.model.ch = 32
-    enc_config.model.num_res_blocks = 2
+    enc_config.model.num_res_blocks = 3
     enc_config.model.ch_mult = [1, 2, 4, 8]
 
     # TODO: change autoencoer to Denoising Variational Autoencoder
@@ -108,72 +107,9 @@ def main(args):
     else:
         global_step, init_epoch = 0, 0
 
-    for epoch in range(init_epoch, args.epochs):
-        # update lrs.
-        if args.distributed:
-            train_queue.sampler.set_epoch(global_step + args.seed)
-            valid_queue.sampler.set_epoch(0)
+    sample_latent(train_queue, model, denoiser, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging)
 
-        if epoch > args.warmup_epochs:
-            cnn_scheduler.step()
-
-        # Logging.
-        logging.info('epoch %d', epoch)
-
-        # Training.
-        train_nelbo, global_step = train(train_queue, model, denoiser, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging)
-        logging.info('train_nelbo %f', train_nelbo)
-        writer.add_scalar('train/nelbo', train_nelbo, global_step)
-        model.eval()
-
-        save_freq = int(np.ceil(args.epochs / 100))
-        if epoch % save_freq == 0 or epoch == (args.epochs - 1):
-            if args.global_rank == 0:
-                logging.info('saving the model.')
-                torch.save({'epoch': epoch + 1, 'state_dict': model.state_dict(),
-                            'optimizer': cnn_optimizer.state_dict(), 'global_step': global_step,
-                            'args': args, 'arch_instance': arch_instance, 'scheduler': cnn_scheduler.state_dict(),
-                            'grad_scalar': grad_scalar.state_dict()}, checkpoint_file)
-
-        # generate samples less frequently
-        # eval_freq = 1 if args.epochs <= 50 else 20
-        eval_freq = 1
-        if epoch % eval_freq == 0 or epoch == (args.epochs - 1):
-            with torch.no_grad():
-                num_samples = 16
-                n = int(np.floor(np.sqrt(num_samples)))
-                for t in [0.7, 0.8, 0.9, 1.0]:
-                    output_img = denoiser.sample(num_samples, model, temperature=t)
-                    # output_img = output.mean if isinstance(output, torch.distributions.bernoulli.Bernoulli) else output.sample(t)
-                    output_tiled = utils.tile_image((output_img + 1) * 0.5, n)
-                    writer.add_image('generated_%0.1f' % t, output_tiled, global_step)
-
-            # TODO: implement accurate ELBO computation 
-            # valid_neg_log_p, valid_nelbo = test(valid_queue, model, denoiser, num_samples=10, args=args, logging=logging)
-
-            # logging.info('valid_nelbo %f', valid_nelbo)
-            # logging.info('valid neg log p %f', valid_neg_log_p)
-            # logging.info('valid bpd elbo %f', valid_nelbo * bpd_coeff)
-            # logging.info('valid bpd log p %f', valid_neg_log_p * bpd_coeff)
-            # writer.add_scalar('val/neg_log_p', valid_neg_log_p, epoch)
-            # writer.add_scalar('val/nelbo', valid_nelbo, epoch)
-            # writer.add_scalar('val/bpd_log_p', valid_neg_log_p * bpd_coeff, epoch)
-            # writer.add_scalar('val/bpd_elbo', valid_nelbo * bpd_coeff, epoch)
-
-
-
-    # Final validation
-    # valid_neg_log_p, valid_nelbo = test(valid_queue, model, num_samples=1000, args=args, logging=logging)
-    # logging.info('final valid nelbo %f', valid_nelbo)
-    # logging.info('final valid neg log p %f', valid_neg_log_p)
-    # writer.add_scalar('val/neg_log_p', valid_neg_log_p, epoch + 1)
-    # writer.add_scalar('val/nelbo', valid_nelbo, epoch + 1)
-    # writer.add_scalar('val/bpd_log_p', valid_neg_log_p * bpd_coeff, epoch + 1)
-    # writer.add_scalar('val/bpd_elbo', valid_nelbo * bpd_coeff, epoch + 1)
-    writer.close()
-
-
-def train(train_queue, model, denoiser, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging):
+def sample_latent(train_queue, model, denoiser, cnn_optimizer, grad_scalar, global_step, warmup_iters, writer, logging):
     alpha_i = utils.kl_balancer_coeff(num_scales=model.num_latent_scales,
                                       groups_per_scale=model.groups_per_scale, fun='square')
     nelbo = utils.AvgrageMeter()
@@ -186,13 +122,12 @@ def train(train_queue, model, denoiser, cnn_optimizer, grad_scalar, global_step,
         x = utils.pre_process(x, args.num_x_bits, normalize=True)
 
         # TODO: sample prev_x, next_x, trg_x, timestep
-        prev_timestep, next_timestep = denoiser.antithetic_timestep_sample(len(x))
-        # timestep =  denoiser.trg_step.index_select(0, prev_time)
-        prev_x, a_prev = denoiser.sample_noised(x, torch.randn_like(x), prev_timestep)
-        next_x, a_next = denoiser.sample_noised(x, torch.randn_like(x), next_timestep)
-        _, cond_x = denoiser.denoise_step(prev_x, prev_timestep)
-        _, trg_x = denoiser.denoise_step(next_x, next_timestep)
-        # trg_eps = next_x - cond_x
+        tidx = denoiser.antithetic_timestep_sample(len(x))
+        timestep =  denoiser.trg_step.index_select(0, tidx)
+        prev_x, a_prev = denoiser.sample_noised(x, torch.randn_like(x), tidx+1)
+        next_x, a_next = denoiser.sample_noised(x, torch.randn_like(x), tidx)
+        # _, cond_x = denoiser.denoise_step(prev_x, tidx)
+        _, trg_x = denoiser.denoise_step(next_x, tidx)
         # trg_eps = (prev_x - trg_x * a_prev.sqrt()) / (1 - a_prev).sqrt()
 
         # warm-up lr
@@ -207,7 +142,7 @@ def train(train_queue, model, denoiser, cnn_optimizer, grad_scalar, global_step,
 
         cnn_optimizer.zero_grad()
         with autocast():
-            logits, log_q, log_p, kl_all, kl_diag = model(trg_x, cond_x, prev_timestep, next_timestep)
+            logits, log_q, log_p, kl_all, kl_diag = model(trg_x, prev_x, timestep)
 
             # TODO: assert pred_eps is NormalDecoder
 
@@ -254,8 +189,7 @@ def train(train_queue, model, denoiser, cnn_optimizer, grad_scalar, global_step,
                 # cond_xtiled = utils.tile_image(cond_x[:n*n], n)
                 x_tiled = utils.tile_image(x_img, n)
                 output_tiled = utils.tile_image(output_img, n)
-                cond_tiled = utils.tile_image(cond_x[:n*n], n)
-                in_out_tiled = ((torch.cat((prev_tiled, x_tiled, output_tiled, cond_tiled), dim=2) + 1) * 0.5).clip(min=0, max=1)
+                in_out_tiled = ((torch.cat((prev_tiled, x_tiled, output_tiled), dim=2) + 1) * 0.5).clip(min=0, max=1)
                 writer.add_image('reconstruction', in_out_tiled, global_step)
 
             # norm
@@ -289,55 +223,6 @@ def train(train_queue, model, denoiser, cnn_optimizer, grad_scalar, global_step,
 
     utils.average_tensor(nelbo.avg, args.distributed)
     return nelbo.avg, global_step
-
-
-def test(valid_queue, model, denoiser, num_samples, args, logging):
-    #  TODO : Accurate ELBO computation need
-
-    if args.distributed:
-        dist.barrier()
-    nelbo_avg = utils.AvgrageMeter()
-    neg_log_p_avg = utils.AvgrageMeter()
-    model.eval()
-    for step, x in enumerate(valid_queue):
-        x = x[0] if len(x) > 1 else x
-        x = x.cuda()
-
-        # change bit length
-        x = utils.pre_process(x, args.num_x_bits, normalize=True)
-
-        # TODO: sample prev_x, next_x, trg_x, timestep
-        timestep = denoiser.antithetic_timestep_sample(len(x))
-        prev_x, a_prev = denoiser.sample_noised(x, timestep)
-        next_timestep = timestep - denoiser.step_size
-        next_x, a_next = denoiser.sample_noised(x, next_timestep)
-        _, trg_x = denoiser.denoise_step(next_x, next_timestep)
-        trg_eps = (prev_x - trg_x * a_prev.sqrt()) / (1 - a_prev).sqrt()
-
-        with torch.no_grad():
-            nelbo, log_iw = [], []
-            for k in range(num_samples):
-                logits, log_q, log_p, kl_all, _ = model(trg_x, prev_x, timestep)
-                pred_eps = model.decoder_output(logits)
-                recon_loss = utils.reconstruction_loss(pred_eps, trg_eps, crop=model.crop_output)
-                balanced_kl, _, _ = utils.kl_balancer(kl_all, kl_balance=False)
-                nelbo_batch = recon_loss + balanced_kl
-                nelbo.append(nelbo_batch)
-                log_iw.append(utils.log_iw(pred_eps, trg_eps, log_q, log_p, crop=model.crop_output))
-
-            nelbo = torch.mean(torch.stack(nelbo, dim=1))
-            log_p = torch.mean(torch.logsumexp(torch.stack(log_iw, dim=1), dim=1) - np.log(num_samples))
-
-        nelbo_avg.update(nelbo.data, x.size(0))
-        neg_log_p_avg.update(- log_p.data, x.size(0))
-
-    utils.average_tensor(nelbo_avg.avg, args.distributed)
-    utils.average_tensor(neg_log_p_avg.avg, args.distributed)
-    if args.distributed:
-        # block to sync
-        dist.barrier()
-    logging.info('val, step: %d, NELBO: %f, neg Log p %f', step, nelbo_avg.avg, neg_log_p_avg.avg)
-    return neg_log_p_avg.avg, nelbo_avg.avg
 
 
 def create_generator_vae(model, batch_size, num_total_samples):

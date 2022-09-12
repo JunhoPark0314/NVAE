@@ -142,7 +142,7 @@ class Diffusion(object):
         
         return xt_next, x0_t
 
-    def sample(self, N, model=None, temperature=1.0):
+    def sample(self, N, model=None, temperature=1.0, cond=None):
         with torch.no_grad():
             if model is None:
                 # Implement this case also
@@ -151,30 +151,64 @@ class Diffusion(object):
             xt = torch.randn(
                 (N, self.img_channels, self.img_size, self.img_size), device=self.device
             )
+            _, x0 = self.denoise_step(xt, self.trg_step[-1] * torch.ones(len(xt), device=self.device, dtype=torch.long))
 
-            xs_list = [xt]
-            x0_list = [xt]
+            # xs_list = [xt]
+            x0_list = [x0]
             tidx_list = reversed(list(range(0, len(self.trg_step))))
 
             for ti in tidx_list:
                 tidx = ti * torch.ones(len(xt), device=self.device, dtype=torch.long)
                 timestep = self.trg_step.index_select(0, tidx)
                 # next_timestep = self.trg_step.index_select(0, tidx)
-                _, cond_x = self.denoise_step(xt, timestep)
-                logits = model.inference(cond_x, timestep, temperature)
+                # _, x0 = self.denoise_step(xt, timestep)
+                logits = model.inference(x0, timestep, temperature)
 
                 a = compute_alpha(self.betas, timestep)
-                pred_diff = model.decoder_output(logits, xt, a).sample()
-                pred_x0 = cond_x + pred_diff
-                pred_eps = (xt - pred_x0 * a.sqrt()) / (1 - a).sqrt()
+                x0 = model.decoder_output(logits, xt, a).sample()
+                # pred_x0 = cond_x + pred_diff
+                # pred_eps = (xt - x0 * a.sqrt()) / (1 - a).sqrt()
 
-                xs, x0_t = self.denoise_step(xt, timestep, eps=pred_eps)
-                xs_list.append(xs.clone())
-                x0_list.append(x0_t)
-                xt = xs
+                # xt, x0 = self.denoise_step(xt, timestep, eps=pred_eps)
+                # xs_list.append(xt.clone())
+                x0_list.append(x0)
 
         # return xs_list, x0_list
-        return xs_list[-1]
+        return x0_list[-1]
+
+    # def sample(self, N, model=None, temperature=1.0):
+    #     with torch.no_grad():
+    #         if model is None:
+    #             # Implement this case also
+    #             model = self.trg_denoiser
+
+    #         xt = torch.randn(
+    #             (N, self.img_channels, self.img_size, self.img_size), device=self.device
+    #         )
+
+    #         xs_list = [xt]
+    #         x0_list = [xt]
+    #         tidx_list = reversed(list(range(0, len(self.trg_step))))
+
+    #         for ti in tidx_list:
+    #             tidx = ti * torch.ones(len(xt), device=self.device, dtype=torch.long)
+    #             timestep = self.trg_step.index_select(0, tidx)
+    #             # next_timestep = self.trg_step.index_select(0, tidx)
+    #             _, cond_x = self.denoise_step(xt, timestep)
+    #             logits = model.inference(cond_x, timestep, temperature)
+
+    #             a = compute_alpha(self.betas, timestep)
+    #             pred_diff = model.decoder_output(logits, xt, a).sample()
+    #             pred_x0 = cond_x + pred_diff
+    #             pred_eps = (xt - pred_x0 * a.sqrt()) / (1 - a).sqrt()
+
+    #             xs, x0_t = self.denoise_step(xt, timestep, eps=pred_eps)
+    #             xs_list.append(xs.clone())
+    #             x0_list.append(x0_t)
+    #             xt = xs
+
+    #     # return xs_list, x0_list
+    #     return xs_list[-1]
 
     def test(self):
         pass

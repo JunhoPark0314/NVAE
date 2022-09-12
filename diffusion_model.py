@@ -216,7 +216,7 @@ class AutoEncoder(nn.Module):
         self.sr_u = {}
         self.sr_v = {}
         self.num_power_iter = 4
-        self.unet_enc = DenoiserEncoder(denoiser_config) 
+        # self.unet_enc = DenoiserEncoder(denoiser_config) 
 
         # st_res = 64
         # enc_ch = self.num_channels_enc
@@ -390,14 +390,20 @@ class AutoEncoder(nn.Module):
         return nn.Sequential(nn.ELU(),
                              Conv2D(C_in, C_out, 3, padding=1, bias=True))
 
-    def forward(self, trg_x, prev_x, timestep):
-        temb = get_timestep_embedding(timestep, self.t_dim)
-        hs = self.unet_enc(prev_x, timestep)
-        s = self.stem(trg_x)
+    def forward(self, trg_x, prev_x, trg_timestep, prev_timestep):
+        temb = get_timestep_embedding(torch.cat([trg_timestep, prev_timestep]), self.t_dim)
+        enc_x = torch.cat([trg_x,prev_x])
+        B = len(trg_x)
+        TRG = torch.arange(B, device=trg_x.device)
+        PREV = TRG + B
+        skip_cell_s = []
+
+        s = self.stem(enc_x)
 
         # perform pre-processing
         for cell in self.pre_process:
             s = cell(s)
+            skip_cell_s.append(s[PREV])
 
         # run the main encoder tower
         combiner_cells_enc = []
@@ -405,17 +411,22 @@ class AutoEncoder(nn.Module):
         for cell in self.enc_tower:
             if cell.cell_type == 'combiner_enc':
                 combiner_cells_enc.append(cell)
-                combiner_cells_s.append(s)
+                combiner_cells_s.append(s[TRG])
             else:
                 s = cell(s, temb)
+            if cell.cell_type in ['combiner_enc', 'down_enc']:
+                skip_cell_s.append(s[PREV])
 
         # reverse combiner cells and their input for decoder
         combiner_cells_enc.reverse()
         combiner_cells_s.reverse()
 
+        s, prev_s = torch.chunk(s, 2, 0)
+        s = s.detach()
+
         idx_dec = 0
         ftr = self.enc0(s)                            # this reduces the channel dimension
-        param0 = self.enc_sampler[idx_dec](ftr, temb)
+        param0 = self.enc_sampler[idx_dec](ftr, temb[TRG])
         mu_q, log_sig_q = torch.chunk(param0, 2, dim=1)
         dist = Normal(mu_q, log_sig_q)   # for the first approx. posterior
         z, _ = dist.sample()
@@ -431,10 +442,14 @@ class AutoEncoder(nn.Module):
         all_log_q = [log_q_conv]
 
         # To make sure we do not pass any deterministic features from x to decoder.
-        s = 0
+        s=0
 
         # prior for z0
-        dist = Normal(mu=torch.zeros_like(z), log_sigma=torch.zeros_like(z))
+        prev_ftr = self.enc0(prev_s)
+        param0_prev = self.enc_sampler[idx_dec](prev_ftr, temb[PREV])
+        mu_prev, log_sig_prev = torch.chunk(param0_prev, 2, dim=1)
+
+        dist = Normal(mu=torch.zeros_like(z) + mu_prev, log_sigma=torch.zeros_like(z) + log_sig_prev)
         log_p_conv = dist.log_p(z)
         all_p = [dist]
         all_log_p = [log_p_conv]
@@ -442,18 +457,20 @@ class AutoEncoder(nn.Module):
         idx_dec = 0
         s = self.prior_ftr0.unsqueeze(0)
         batch_size = z.size(0)
-        s = s.expand(batch_size, -1, -1, -1) + hs.pop()
+        s = s.expand(batch_size, -1, -1, -1) + prev_ftr
 
         for cell, skip_cell in zip(self.dec_tower, self.dec_skip_tower):
             if cell.cell_type == 'combiner_dec':
                 if idx_dec > 0:
                     # form prior
-                    param = self.dec_sampler[idx_dec - 1](nn.ELU()(s), temb)
-                    mu_p, log_sig_p = torch.chunk(param, 2, dim=1)
+                    prev_ftr = combiner_cells_enc[idx_dec - 1](skip_cell_s[-1], s, temb[PREV])
+                    prev_param = self.enc_sampler[idx_dec](prev_ftr, temb[PREV])
+                    param = self.dec_sampler[idx_dec - 1](nn.ELU()(s), temb[PREV])
+                    mu_p, log_sig_p = torch.chunk(param + prev_param, 2, dim=1)
 
                     # form encoder
-                    ftr = combiner_cells_enc[idx_dec - 1](combiner_cells_s[idx_dec - 1], s, temb)
-                    param = self.enc_sampler[idx_dec](ftr, temb)
+                    ftr = combiner_cells_enc[idx_dec - 1](combiner_cells_s[idx_dec - 1].detach(), s, temb[TRG])
+                    param = self.enc_sampler[idx_dec](ftr, temb[TRG])
                     mu_q, log_sig_q = torch.chunk(param, 2, dim=1)
                     dist = Normal(mu_p + mu_q, log_sig_p + log_sig_q) if self.res_dist else Normal(mu_q, log_sig_q)
                     z, _ = dist.sample()
@@ -473,26 +490,27 @@ class AutoEncoder(nn.Module):
                     all_log_p.append(log_p_conv)
 
                 # 'combiner_dec'
-                skip = hs.pop()
-                s = cell(s, z, temb) + skip_cell(skip, temb)
+                skip = skip_cell_s.pop()
+                s = cell(s, z, temb[PREV]) + skip_cell(skip, temb[PREV])
                 idx_dec += 1
             else:
                 if cell.cell_type == 'up_dec':
-                    skip = hs.pop()
-                    skip = skip_cell(skip, temb)
+                    skip = skip_cell_s.pop()
+                    skip = skip_cell(skip, temb[PREV])
                 else:
                     skip = 0
-                s = cell(s, temb) + skip
+                s = cell(s, temb[PREV]) + skip
         
         if self.vanilla_vae:
             s = self.stem_decoder(z)
 
         for cell, skip_cell in zip(self.post_process, self.post_skip_tower):
-            s = cell(s) + skip_cell(hs.pop(), temb)
+            s = cell(s) + skip_cell(skip_cell_s.pop(), temb[PREV])
 
-        assert not hs
+        assert not skip_cell_s
 
         logits = self.image_conditional(s)
+        logits[:,:3] += prev_x
 
         # compute kl
         kl_all = []
@@ -514,33 +532,61 @@ class AutoEncoder(nn.Module):
     def inference(self, prev_x, timestep, temperature=1.0):
         num_samples = len(prev_x)
         temb = get_timestep_embedding(timestep, self.t_dim)
-        hs = self.unet_enc(prev_x, timestep)
+        skip_cell_s = []
 
+        enc_s = self.stem(prev_x)
 
-        scale_ind = 0
+        # perform pre-processing
+        for cell in self.pre_process:
+            enc_s = cell(enc_s)
+            skip_cell_s.append(enc_s)
+
+        # run the main encoder tower
+        combiner_cells_enc = []
+        combiner_cells_s = []
+        for cell in self.enc_tower:
+            if cell.cell_type == 'combiner_enc':
+                combiner_cells_enc.append(cell)
+                combiner_cells_s.append(enc_s)
+            else:
+                enc_s = cell(enc_s, temb)
+
+            if cell.cell_type in ['combiner_enc', 'down_enc']:
+                skip_cell_s.append(enc_s)
+
+        combiner_cells_enc.reverse()
+        combiner_cells_s.reverse()
+
+        # prior for z0
+        idx_dec = 0
+        prev_ftr = self.enc0(enc_s)
+        param0_prev = self.enc_sampler[idx_dec](prev_ftr, temb)
+        mu_prev, log_sig_prev = torch.chunk(param0_prev, 2, dim=1)
+
         z0_size = [num_samples] + self.z0_size
-        dist = Normal(mu=torch.zeros(z0_size).cuda(), log_sigma=torch.zeros(z0_size).cuda(), temp=temperature)
+        dist = Normal(mu=torch.zeros(z0_size).cuda() + mu_prev, log_sigma=torch.zeros(z0_size).cuda() + log_sig_prev, temp=temperature)
         z, _ = dist.sample()
 
-        idx_dec = 0
         s = self.prior_ftr0.unsqueeze(0)
         batch_size = z.size(0)
-        s = s.expand(batch_size, -1, -1, -1) + hs.pop()
+        s = s.expand(batch_size, -1, -1, -1) + prev_ftr
         for cell, skip_cell in zip(self.dec_tower, self.dec_skip_tower):
             if cell.cell_type == 'combiner_dec':
                 if idx_dec > 0:
                     # form prior
+                    prev_ftr = combiner_cells_enc[idx_dec - 1](skip_cell_s[-1], s, temb)
+                    prev_param = self.enc_sampler[idx_dec](prev_ftr, temb)
                     param = self.dec_sampler[idx_dec - 1](nn.ELU()(s), temb)
-                    mu, log_sigma = torch.chunk(param, 2, dim=1)
+                    mu, log_sigma = torch.chunk(param + prev_param, 2, dim=1)
                     dist = Normal(mu, log_sigma, temperature)
                     z, _ = dist.sample()
 
                 # 'combiner_dec'
-                s = cell(s, z, temb) + skip_cell(hs.pop(), temb)
+                s = cell(s, z, temb) + skip_cell(skip_cell_s.pop(), temb)
                 idx_dec += 1
             else:
                 if cell.cell_type == 'up_dec':
-                    skip = hs.pop()
+                    skip = skip_cell_s.pop()
                     skip = skip_cell(skip, temb)
                 else:
                     skip = 0
@@ -550,11 +596,13 @@ class AutoEncoder(nn.Module):
             s = self.stem_decoder(z)
 
         for cell, skip_cell in zip(self.post_process, self.post_skip_tower):
-            s = cell(s) + skip_cell(hs.pop(), temb)
+            s = cell(s) + skip_cell(skip_cell_s.pop(), temb)
 
-        assert not hs
+        assert not skip_cell_s
 
         logits = self.image_conditional(s)
+        logits[:,:3] += prev_x
+
         return logits
 
     def decoder_output(self, logits, prev_x, a_prev):
